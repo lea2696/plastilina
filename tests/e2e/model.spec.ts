@@ -1,0 +1,24 @@
+import { test, expect } from '@playwright/test';
+import { openSettings } from './ui';
+import fs from 'node:fs';
+test('self-hosted MediaPipe worker loads and fake camera can be stopped', async ({page,context})=>{
+ test.setTimeout(60000);await context.grantPermissions(['camera']);
+ const errors:string[]=[];const responses:Array<{url:string;status:number}>=[];
+ const requests:Array<{url:string;method:string}>=[];let transferred=0;const resources:Array<{path:string;bytes:number}>=[];
+ page.on('request',r=>requests.push({url:r.url(),method:r.method()}));
+ page.on('requestfinished',async r=>{const size=await r.sizes();const bytes=Math.max(0,size.responseBodySize)+Math.max(0,size.responseHeadersSize);transferred+=bytes;resources.push({path:new URL(r.url()).pathname,bytes});});
+ page.on('pageerror',e=>errors.push(e.message));page.on('response',r=>{if(r.url().includes('/vendor/mediapipe/'))responses.push({url:r.url(),status:r.status()});});
+ await page.goto('/');await page.getByRole('button',{name:'Comenzar con cámara'}).click();
+ await expect(page.getByRole('status')).toContainText(/Mostrá una mano|Cámara lista|Se perdió el seguimiento/, {timeout:45000});
+ await openSettings(page);await page.getByRole('button',{name:'Diagnóstico'}).click();
+ await expect.poll(async()=>{const raw=await page.locator('output').textContent();return raw?JSON.parse(raw).inferenceMs:0;},{timeout:20000}).toBeGreaterThan(0);
+ await openSettings(page);await page.getByRole('button',{name:'Apagar cámara'}).click();
+ await expect(page.locator('p.status')).toContainText('Cámara apagada');
+ expect(responses.some(r=>r.url.endsWith('hand_landmarker.task')&&r.status===200)).toBe(true);
+ expect(responses.some(r=>r.url.endsWith('.wasm')&&r.status===200)).toBe(true);
+ expect(requests.every(r=>new URL(r.url).origin==='http://127.0.0.1:4173'&&r.method==='GET')).toBe(true);
+ expect(errors).toEqual([]);
+ await expect.poll(()=>resources.some(r=>r.path.endsWith('hand_landmarker.task'))&&resources.some(r=>r.path.endsWith('.wasm'))).toBe(true);
+ fs.mkdirSync('artifacts/qa',{recursive:true});fs.writeFileSync('artifacts/qa/browser-transfer.json',JSON.stringify({kind:'local-preview-fake-camera-request-sizes',bytes:transferred,mebibytes:transferred/1048576,resources},null,2));
+ expect(transferred).toBeLessThanOrEqual(35*1048576);
+});

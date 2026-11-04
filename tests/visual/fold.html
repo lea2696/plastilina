@@ -1,0 +1,9 @@
+<!doctype html><html><head><meta charset="utf-8"/><title>Fold QA fixture</title><style>html,body{margin:0;width:100%;height:100%;background:#e9ded1}canvas{display:block;width:100%;height:100%}</style></head><body><canvas id="view"></canvas><script type="module">
+import {ClaySolver} from '/src/simulation/ClaySolver.ts';
+import {Studio} from '/src/rendering/Studio.ts';
+const solver=new ClaySolver();for(let i=0;i<180;i++)solver.step(1/120);
+const steps=Math.min(2400,Math.max(0,Number(new URLSearchParams(location.search).get('steps')??2400)));
+let selfContacts=0,maxInverted=0;for(let i=0;i<steps;i++){const q=(i%120)/120;solver.step(1/120,[{id:'move',kind:'tip',center:[0.12-0.26*q,0.29-0.1*q,0],radius:0.085,velocity:[0,0,0],grasp:true},{id:'hold',kind:'tip',center:[-0.13,0.17,0],radius:0.08,velocity:[0,0,0],grasp:true}]);selfContacts+=solver.selfContactCount;maxInverted=Math.max(maxInverted,solver.invertedTetCount());}
+if(new URLSearchParams(location.search).has('rest'))for(let i=0;i<360;i++)solver.step(1/120);
+const studio=new Studio(document.getElementById('view'),solver);studio.update(solver,[]);studio.render();window.qa={steps,selfContacts,maxInverted,finalInverted:solver.invertedTetCount(),volume:solver.surfaceVolume(),restVolume:solver.restSurfaceVolume};
+</script></body></html>

@@ -1,0 +1,20 @@
+import { test, expect } from '@playwright/test';
+import { openSettings } from './ui';
+test('initial studio and synthetic replay', async ({page}) => {
+ const errors:string[]=[];page.on('pageerror',e=>errors.push(e.message));page.on('console',message=>{if(message.type()==='error')errors.push(message.text());});page.on('response',response=>{if(response.status()>=400)errors.push(`${response.status()} ${response.url()}`);});
+ await page.setViewportSize({width:1440,height:900});await page.goto('/');
+ await expect(page.getByRole('button',{name:'Comenzar con cámara'})).toBeVisible();
+ await expect(page.locator('.app')).toHaveClass(/dark/);
+ await openSettings(page);await page.getByRole('button',{name:'Modo claro'}).click();
+ await expect(page.locator('.app')).toHaveClass(/light/);
+ await openSettings(page);await page.getByRole('button',{name:'Modo oscuro'}).click();
+ await expect(page.locator('.app')).toHaveClass(/dark/);
+ await page.screenshot({path:'artifacts/qa/initial-studio.png'});
+ await page.getByRole('button',{name:'Observar demo sintética'}).click();
+ await expect(page.getByRole('status')).toContainText('sintética');
+ const skip=page.getByRole('button',{name:'Omitir introducción'});if(await skip.isVisible())await skip.click();
+ await page.waitForTimeout(1000);await page.screenshot({path:'artifacts/qa/synthetic-demo.png'});
+ await openSettings(page);await page.getByRole('button',{name:'Diagnóstico'}).click();
+ await expect(page.locator('output')).toContainText('"source":"replay"');
+ expect(errors).toEqual([]);
+});

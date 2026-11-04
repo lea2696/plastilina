@@ -1,0 +1,660 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Yoyó render QA fixture</title>
+  <link rel="icon" href="data:," />
+  <style>
+    html, body { margin: 0; width: 100%; height: 100%; background: #0a0e13; overflow: hidden; }
+    canvas { display: block; width: 100%; height: 100%; }
+    #fail { position: fixed; inset: 0; display: none; place-items: center; color: #cfd8e3; font: 16px system-ui, sans-serif; }
+  </style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<div id="fail">WebGL2 no disponible</div>
+<script type="module">
+/*
+ * Visual fixture for the yoyó renderer. Hand-written YoyoSnapshots, no runtime needed. SYNTHETIC input
+ * only: nothing here is a camera, a hand or a person.
+ *
+ *   ?state=<name>          a still state, drawn after the eases have settled (see STATES)
+ *   ?state=cues            plays a snap and a catch and records what the renderer drew, at 240 Hz
+ *   ?state=lifecycle       create / dispose / create again on the same canvas, then draw
+ *   ?state=context         lose and restore the WebGL context and compare the frames before and after
+ *   ?state=mapping         where the renderer really draws a marker versus where visibleWorld() says it is
+ *   ?state=quality         the adaptive pixel ratio driven by synthetic slow and fast frame times
+ *   ?state=programs        counts compiled shader programs after construction and after every state was shown
+ *   ?sheet=colors          every YOYO_COLORS entry, slow spin over fast spin, composed in one 2D sheet
+ *   ?sheet=sequence        one scripted throw (tie-on, roll, snap, sleep, return, catch) as a strip of frames
+ *   ?bench=sync|raf|finish|soak
+ *                          sync: CPU cost of render(); raf: the same with real vsync pacing and frame
+ *                          intervals; finish: render() + a 1-pixel readPixels, which waits for the GPU, so
+ *                          it includes the GPU work (&worst=1 adds the pause dimming on top of everything
+ *                          else); soak: 20 000 frames, retained heap and resource counts
+ *   &reduced=1             prefers-reduced-motion
+ *   &antialias=0           no multisampling (cost experiments)
+ *   &hide=backdrop         hide the always-on backdrop (cost experiments)
+ *   &scene=empty           the bench draws only the backdrop (nothing tied, no hand), to split the GPU cost
+ *
+ * window.qa carries the results; window.qa.ready becomes true when the page is done.
+ *
+ * Some measurements read private members of the renderer (renderer.renderer, .yoyo, .camera, .backdrop):
+ * they are QA probes that observe what was drawn, and they are not part of the renderer's API.
+ */
+import { YoyoRenderer, YOYO_COLORS } from '/src/yoyo/render/YoyoRenderer.ts';
+import { templateHand } from '/src/yoyo/render/handGeometry.ts';
+
+const params = new URLSearchParams(location.search);
+const stateName = params.get('state') ?? 'sleeping';
+const benchMode = params.get('bench');
+const sheetMode = params.get('sheet');
+const canvas = document.getElementById('view');
+
+let renderer;
+let constructMs = 0;
+try {
+  const t0 = performance.now();
+  renderer = new YoyoRenderer(canvas, { antialias: params.get('antialias') !== '0' });
+  constructMs = performance.now() - t0;
+} catch (error) {
+  document.getElementById('fail').style.display = 'grid';
+  window.qa = { ready: true, error: String(error) };
+  throw error;
+}
+renderer.setReducedMotion(params.get('reduced') === '1');
+if ((params.get('hide') ?? '').split(',').includes('backdrop')) renderer.backdrop.visible = false;
+
+const HOME = [0, 0.85];
+const PALM = 0.17;
+const MAX_LENGTH = 0.65;
+const FRAME_MS = 1000 / 60;
+let nowMs = 1000;
+
+/** A fully specified snapshot; `over` replaces fields. Plain data, like the engine's. */
+function snapshot(over = {}) {
+  const pivot = over.pivot ?? HOME;
+  const hand = over.hand === null
+    ? { present: true, lostMs: 0, edge: null, landmarks: null, palmWorld: 0 }
+    : {
+        present: true, lostMs: 0, edge: null, palmWorld: PALM,
+        landmarks: templateHand(pivot[0], pivot[1], PALM, over.tilt ?? 0.08),
+        ...over.hand,
+      };
+  return {
+    timeMs: 0, phase: 'sleeping', responsiveness: 'responsive',
+    pivot, pivotVelocity: [0, 0],
+    yoyo: [pivot[0], pivot[1] - MAX_LENGTH], yoyoVelocity: [0, 0],
+    length: MAX_LENGTH, maxLength: MAX_LENGTH,
+    spin: 600, spinAngle: 0, tension: 0.6, slack: false,
+    paused: false, events: [], steps: 4, droppedMs: 0,
+    ...over,
+    hand,
+  };
+}
+
+/** Yoyo position for a string of length L under the pivot, swung by `angle` rad from vertical. */
+function hang(pivot, length, angle = 0) {
+  return [pivot[0] + length * Math.sin(angle), pivot[1] - length * Math.cos(angle)];
+}
+
+const STATES = {
+  // Tied on, hanging in a short loop under the hand.
+  tethered: () => snapshot({ phase: 'tethered', yoyo: [0, HOME[1] - 0.025], length: 0.025, spin: 4, tension: 0.3 }),
+  // Just tied on: the snap flash is still running (the event fires on the first frame only).
+  'tethered-flash': (frame) => snapshot({
+    phase: 'tethered', yoyo: [0, HOME[1] - 0.025], length: 0.025, spin: 4, tension: 0.3,
+    events: frame === 0 ? [{ kind: 'tether', timeMs: 0 }] : [],
+  }),
+  // Unrolling down the string, spinning fast.
+  rolling: (frame) => snapshot({
+    phase: 'rolling', yoyo: hang(HOME, 0.3, 0.03), length: 0.3, spin: 480, spinAngle: frame * 8, tension: 0.5,
+  }),
+  // At full length, sleeping: streak and ring at full spin.
+  sleeping: (frame) => snapshot({
+    phase: 'sleeping', yoyo: hang(HOME, MAX_LENGTH, 0.05), length: MAX_LENGTH, spin: 620, spinAngle: frame * 10, tension: 0.6,
+  }),
+  // A slow spin: the pattern on the face is readable (and the ring is faint).
+  'slow-spin': (frame) => snapshot({
+    phase: 'sleeping', yoyo: hang(HOME, MAX_LENGTH, 0.05), length: MAX_LENGTH, spin: 24, spinAngle: frame * 0.4, tension: 0.6,
+  }),
+  // A medium spin where the pattern is half smeared.
+  'mid-spin': (frame) => snapshot({
+    phase: 'sleeping', yoyo: hang(HOME, MAX_LENGTH, 0.05), length: MAX_LENGTH, spin: 110, spinAngle: frame * 1.8, tension: 0.6,
+  }),
+  // The hand moved toward the yoyo faster than it winds: slack, sagging string.
+  slack: () => snapshot({
+    phase: 'returning', pivot: [0.1, 0.8], yoyo: [0.0, 0.33], length: 0.62, spin: 320, tension: 0, slack: true,
+  }),
+  // Winding back up, string under tension (warm tint).
+  returning: (frame) => snapshot({
+    phase: 'returning', yoyo: hang(HOME, 0.34, -0.02), length: 0.34, spin: 760, spinAngle: frame * 12, tension: 6,
+  }),
+  // Mouse path: no landmarks, a grip marker at the pivot.
+  mouse: (frame) => snapshot({
+    phase: 'sleeping', pivot: [0.05, 0.85], hand: null, yoyo: hang([0.05, 0.85], MAX_LENGTH, 0.04),
+    length: MAX_LENGTH, spin: 560, spinAngle: frame * 10,
+  }),
+  // Mouse path, just tied on: the grip marker must stay visible over the yoyo that hangs from it.
+  'mouse-tethered': () => snapshot({
+    phase: 'tethered', pivot: [0.05, 0.85], hand: null, yoyo: [0.05, 0.825], length: 0.025, spin: 4, tension: 0.3,
+  }),
+  // Framing step: the guide is drawn, the player's hand is up, nothing is tied yet.
+  guide: () => snapshot({
+    phase: 'untethered', pivot: [0.04, 0.78], yoyo: [0, 0], length: 0, spin: 0, tension: 0,
+    hand: { present: true, edge: null },
+  }),
+  // Spin spent: the yoyo hangs, no streak, no ring, the pattern turns slowly.
+  exhausted: (frame) => snapshot({
+    phase: 'exhausted', yoyo: hang(HOME, MAX_LENGTH, 0.02), length: MAX_LENGTH, spin: 8, spinAngle: frame * 0.1, tension: 0.6,
+  }),
+  // Paused: everything dims.
+  paused: () => snapshot({ phase: 'sleeping', yoyo: hang(HOME, MAX_LENGTH, 0.05), spin: 620, paused: true }),
+  // Hand data went stale: the hand silhouette fades, the yoyo hangs on.
+  'hand-lost': () => snapshot({
+    phase: 'sleeping', yoyo: hang(HOME, MAX_LENGTH, 0.0), spin: 540,
+    hand: { present: false, lostMs: 700 },
+  }),
+  // Hand at the bottom edge of the frame: amber warning tint.
+  edge: () => snapshot({
+    phase: 'sleeping', pivot: [0.0, 0.55], yoyo: hang([0, 0.55], 0.4, 0.1), length: 0.4,
+    hand: { present: true, edge: 'bottom' },
+  }),
+  // Yoyo low over the floor: the blob shadow is dark and tight.
+  'near-floor': () => snapshot({
+    phase: 'sleeping', pivot: [-0.15, 0.62], yoyo: hang([-0.15, 0.62], 0.6, 0.15), length: 0.6, spin: 500,
+  }),
+};
+
+const special = new Set(['cues', 'lifecycle', 'context', 'mapping', 'quality', 'programs']);
+const build = STATES[stateName];
+if (!build && !benchMode && !sheetMode && !special.has(stateName)) throw new Error(`unknown state ${stateName}`);
+
+/** Renders `frames` consecutive frames of a still state (spin angle advances, eases settle). */
+function settle(frames, target = build) {
+  for (let i = 0; i < frames; i++) {
+    renderer.render(target(i), nowMs);
+    nowMs += FRAME_MS;
+  }
+}
+
+// --- animated scenario for the cost measurement -----------------------------------------------------
+const CYCLE_MS = 5600;
+function scenario(t) {
+  const c = t % CYCLE_MS;
+  const sway = Math.sin(t / 900);
+  const pivot = [0.05 * sway, 0.85 + 0.02 * Math.sin(t / 700)];
+  const tilt = 0.1 * Math.sin(t / 1100);
+  const events = [];
+  let phase, length, spin, tension = 0.6, slack = false, angle = 0.1 * Math.sin(t / 600);
+  if (c < 800) { phase = 'tethered'; length = 0.025; spin = 4; angle = 0; }
+  else if (c < 1250) { phase = 'rolling'; const k = (c - 800) / 450; length = 0.025 + (MAX_LENGTH - 0.025) * k * k; spin = 380 + 320 * k; }
+  else if (c < 4200) { phase = 'sleeping'; length = MAX_LENGTH; spin = 700 * Math.exp(-(c - 1250) / 4000); }
+  else if (c < 5000) { phase = 'returning'; const k = (c - 4200) / 800; length = MAX_LENGTH - (MAX_LENGTH - 0.03) * k; spin = 700 * (1 - 0.4 * k); tension = 4; slack = k > 0.5 && k < 0.65; }
+  else { phase = 'caught'; length = 0.03; spin = 60; angle = 0; }
+  if (Math.abs(c - 800) < FRAME_MS / 2) events.push({ kind: 'tether', timeMs: t });
+  if (Math.abs(c - 1250) < FRAME_MS / 2) { events.push({ kind: 'snap', timeMs: t, strength: 3 }); tension = 40; }
+  if (Math.abs(c - 5000) < FRAME_MS / 2) events.push({ kind: 'catch', timeMs: t, strength: 2 });
+  const chord = slack ? length * 0.8 : length;
+  return snapshot({
+    timeMs: t, phase, pivot, yoyo: hang(pivot, chord, angle), length, spin, spinAngle: (t * spin / 1000) % 6.283185307,
+    tension, slack, events, tilt, hand: { present: !(c > 3000 && c < 3150), lostMs: 0 },
+  });
+}
+
+/** One full cycle of the scenario at 60 Hz, built once so that the timed loops allocate nothing themselves. */
+function scenarioCycle() {
+  const frames = [];
+  for (let t = 0; t < CYCLE_MS; t += FRAME_MS) frames.push(scenario(1000 + t));
+  return frames;
+}
+
+function percentile(sorted, p) {
+  return sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))];
+}
+function summarise(values) {
+  const sorted = [...values].sort((a, b) => a - b);
+  return {
+    n: sorted.length,
+    p50: percentile(sorted, 0.5), p95: percentile(sorted, 0.95), p99: percentile(sorted, 0.99), max: sorted[sorted.length - 1],
+    mean: sorted.reduce((a, b) => a + b, 0) / sorted.length,
+  };
+}
+
+const glContext = () => renderer.renderer.getContext();
+const worst = params.get('worst') === '1';
+const syncPixel = new Uint8Array(4);
+/** Waits for the GPU: reading a pixel back cannot return before the frame (and its MSAA resolve) is done. */
+function waitForGpu() {
+  const gl = glContext();
+  gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, syncPixel);
+}
+
+async function bench(mode) {
+  const WARMUP = 60;
+  const FRAMES = 300;
+  const cpu = [];
+  const intervals = [];
+  if (mode === 'batch') {
+    // GPU throughput: 60 frames queued back to back and ONE wait at the end, repeated; the time per frame is
+    // what the GPU needs per frame once the pipeline is full, which is what a vsync-paced loop pays.
+    const empty = params.get('scene') === 'empty';
+    const cycle = scenarioCycle().map((frame) => {
+      if (empty) return { ...frame, phase: 'untethered', events: [], hand: { present: false, lostMs: 0, edge: null, landmarks: null, palmWorld: 0 } };
+      return worst ? { ...frame, paused: true } : frame;
+    });
+    const BATCH = 60;
+    for (let i = 0; i < 30; i++) renderer.render(cycle[i % cycle.length], 1000 + i * FRAME_MS);
+    waitForGpu();
+    for (let repeat = 0; repeat < 12; repeat++) {
+      const t0 = performance.now();
+      for (let i = 0; i < BATCH; i++) renderer.render(cycle[(repeat * BATCH + i) % cycle.length], 1000 + (repeat * BATCH + i) * FRAME_MS);
+      waitForGpu();
+      cpu.push((performance.now() - t0) / BATCH);
+    }
+  } else if (mode === 'sync' || mode === 'finish') {
+    // sync: CPU cost of render() alone (scene update + GL command submission, no vsync in the way).
+    // finish: the same plus a 1-pixel readPixels, which waits for the GPU, so it includes the work on it.
+    // worst: the pause dimming is on as well, the most overdraw this renderer ever has.
+    const empty = params.get('scene') === 'empty';
+    const cycle = scenarioCycle().map((frame) => {
+      if (empty) return { ...frame, phase: 'untethered', events: [], hand: { present: false, lostMs: 0, edge: null, landmarks: null, palmWorld: 0 } };
+      return worst ? { ...frame, paused: true } : frame;
+    });
+    for (let i = 0; i < WARMUP + FRAMES; i++) {
+      const s = cycle[i % cycle.length];
+      const t0 = performance.now();
+      renderer.render(s, 1000 + i * FRAME_MS);
+      if (mode === 'finish') waitForGpu();
+      const dt = performance.now() - t0;
+      if (i >= WARMUP) cpu.push(dt);
+    }
+  } else {
+    // Real pacing: rAF to rAF, so a GPU-bound frame shows up as a long interval.
+    await new Promise((resolve) => {
+      let i = 0;
+      let last = 0;
+      const step = (now) => {
+        const s = scenario(now);
+        const t0 = performance.now();
+        renderer.render(s, now);
+        const dt = performance.now() - t0;
+        if (i >= WARMUP) { cpu.push(dt); intervals.push(now - last); }
+        last = now;
+        if (++i < WARMUP + FRAMES) requestAnimationFrame(step); else resolve();
+      };
+      requestAnimationFrame(step);
+    });
+  }
+  return {
+    mode, cpuMs: summarise(cpu), frameIntervalMs: intervals.length ? summarise(intervals) : null,
+    stats: renderer.stats(), pixelRatio: renderer.pixelRatio,
+  };
+}
+
+/** Retained JS heap, bytes, after a garbage collection when the browser offers one. */
+async function heapBytes() {
+  if (typeof performance.measureUserAgentSpecificMemory === 'function') {
+    try { return (await performance.measureUserAgentSpecificMemory()).bytes; } catch { /* not allowed here */ }
+  }
+  return performance.memory ? performance.memory.usedJSHeapSize : null;
+}
+
+/** 20 000 frames of the scenario: resources must not grow and the retained heap must stay flat. */
+async function soak() {
+  const FRAMES = 20000;
+  const cycle = scenarioCycle();
+  const counts = () => {
+    const info = renderer.renderer.info;
+    return { geometries: info.memory.geometries, textures: info.memory.textures, programs: info.programs ? info.programs.length : null };
+  };
+  // Warm up: every program compiled, every buffer allocated, JIT settled.
+  for (let i = 0; i < 600; i++) renderer.render(cycle[i % cycle.length], 1000 + i * FRAME_MS);
+  const before = { counts: counts(), heap: await heapBytes() };
+  const t0 = performance.now();
+  for (let i = 0; i < FRAMES; i++) renderer.render(cycle[i % cycle.length], 1000 + (600 + i) * FRAME_MS);
+  const wallMs = performance.now() - t0;
+  const after = { counts: counts(), heap: await heapBytes() };
+  return {
+    frames: FRAMES, wallMs, meanCpuMs: wallMs / FRAMES, before, after,
+    heapGrowthBytes: before.heap !== null && after.heap !== null ? after.heap - before.heap : null,
+  };
+}
+
+// --- render-only cues, measured on the real renderer ---------------------------------------------------
+/**
+ * Plays an impact through the real renderer and records what it DRAWS: the yoyo mesh and the camera.
+ * `snap`: a taut vertical string at full length hit at t = 1000 ms (hit-stop + overshoot + shake).
+ * `catch`: a yoyo climbing toward the hand at 1.5 m/s that is caught at t = 1000 ms (hit-stop + shake).
+ * Sampled at 240 Hz so millisecond-scale jumps cannot hide between frames.
+ */
+function measureCues(kind, reduced) {
+  renderer.setReducedMotion(reduced);
+  const dt = 1000 / 240;
+  const frames = [];
+  for (let t = 0; t <= 2000; t += dt) {
+    const after = t - 1000;
+    let live;
+    let events = [];
+    if (kind === 'snap') {
+      live = [0, HOME[1] - MAX_LENGTH];
+      if (Math.abs(after) < dt / 2) events = [{ kind: 'snap', timeMs: t, strength: 3 }];
+    } else {
+      // Climbing at 1.5 m/s toward the hand, caught at after = 0 and still moving afterwards (a hand that
+      // keeps pulling), so a hit-stop that freezes the pose has something to catch up with.
+      const offset = Math.min(0.05, Math.max(-MAX_LENGTH, -0.03 + 1.5 * (after / 1000)));
+      live = [0, HOME[1] + offset];
+      if (Math.abs(after) < dt / 2) events = [{ kind: 'catch', timeMs: t, strength: 2 }];
+    }
+    const snap = snapshot({
+      timeMs: t, phase: kind === 'snap' ? 'sleeping' : 'returning', yoyo: live, length: kind === 'snap' ? MAX_LENGTH : 0.3,
+      spin: 300, events,
+    });
+    renderer.render(snap, 1000 + t);
+    frames.push({
+      t: after, event: events.length > 0, liveY: live[1], drawnY: renderer.yoyo.position.y, drawnX: renderer.yoyo.position.x,
+      camX: renderer.camera.position.x, camY: renderer.camera.position.y,
+    });
+  }
+  renderer.setReducedMotion(false);
+  return frames;
+}
+
+/** Draws crops of the WebGL canvas around the yoyo into a 2D sheet, for side-by-side comparison. */
+function makeSheet(columns, rows, cell) {
+  const sheet = document.createElement('canvas');
+  sheet.id = 'sheet';
+  sheet.width = columns * cell;
+  sheet.height = rows * cell;
+  sheet.style.cssText = `position:fixed;left:0;top:0;width:${sheet.width}px;height:${sheet.height}px;background:#0a0e13`;
+  return { sheet, ctx: sheet.getContext('2d'), cell };
+}
+function cropYoyo(sheetState, column, row, worldCentre, halfWorld, label) {
+  const { ctx, cell } = sheetState;
+  const ratio = renderer.pixelRatio;
+  const [cx, cy] = window.qa.toScreen(worldCentre[0], worldCentre[1]);
+  const [ex] = window.qa.toScreen(worldCentre[0] + halfWorld, worldCentre[1]);
+  const half = (ex - cx) * ratio;
+  ctx.drawImage(canvas, cx * ratio - half, cy * ratio - half, 2 * half, 2 * half, column * cell, row * cell, cell, cell);
+  if (label) {
+    ctx.fillStyle = 'rgba(220,230,240,0.9)';
+    ctx.font = '600 22px system-ui, sans-serif';
+    ctx.fillText(label, column * cell + 12, row * cell + 30);
+  }
+}
+
+/** Crops a world window (centre and half sizes, m) of the canvas into a sheet cell, scaled to fit it. */
+function cropWorld(sheetState, column, row, centre, halfW, halfH, cellW, cellH, label) {
+  const { ctx } = sheetState;
+  const ratio = renderer.pixelRatio;
+  const [x0, y0] = window.qa.toScreen(centre[0] - halfW, centre[1] + halfH);
+  const [x1, y1] = window.qa.toScreen(centre[0] + halfW, centre[1] - halfH);
+  ctx.drawImage(canvas, x0 * ratio, y0 * ratio, (x1 - x0) * ratio, (y1 - y0) * ratio, column * cellW, row * cellH, cellW, cellH);
+  if (label) {
+    ctx.fillStyle = 'rgba(220,230,240,0.9)';
+    ctx.font = '600 15px system-ui, sans-serif';
+    ctx.fillText(label, column * cellW + 8, row * cellH + 20);
+  }
+}
+
+/** Pixels of the WebGL canvas as drawn by the last render() (valid only inside the same task). */
+function grabFrame() {
+  const copy = document.createElement('canvas');
+  copy.width = canvas.width;
+  copy.height = canvas.height;
+  const ctx = copy.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(canvas, 0, 0);
+  return ctx.getImageData(0, 0, copy.width, copy.height).data;
+}
+
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Loses and restores the context; the frame drawn after must match the frame drawn before. */
+async function contextRoundTrip() {
+  const target = STATES.sleeping;
+  let lostFired = 0;
+  renderer.onContextLost = () => { lostFired++; };
+  settle(60, target);
+  const before = grabFrame();
+  const ext = glContext().getExtension('WEBGL_lose_context');
+  if (!ext) return { error: 'WEBGL_lose_context unavailable' };
+  ext.loseContext();
+  await wait(100);
+  // Drawing while the context is lost must be a no-op, not an exception.
+  let threwWhileLost = false;
+  try { renderer.render(target(0), nowMs); } catch { threwWhileLost = true; }
+  ext.restoreContext();
+  await wait(300);
+  settle(60, target);
+  const after = grabFrame();
+  let sum = 0;
+  let max = 0;
+  for (let i = 0; i < before.length; i += 4) {
+    for (let c = 0; c < 3; c++) {
+      const d = Math.abs(before[i + c] - after[i + c]);
+      sum += d;
+      if (d > max) max = d;
+    }
+  }
+  return { lostFired, threwWhileLost, meanAbsDiff: sum / (before.length / 4 * 3), maxDiff: max, drawCalls: renderer.stats().drawCalls };
+}
+
+
+/**
+ * End-to-end check of visibleWorld(): the mouse mapping and the framing guide trust it, so a marker drawn
+ * at a known world point must land on the pixel the exact rectangle predicts. The marker is the mouse grip
+ * ring (orange, symmetric), found by colour in a window around the prediction and averaged.
+ */
+function measureMapping() {
+  const rect = renderer.visibleWorld();
+  const results = [];
+  const fractions = [0.15, 0.5, 0.85];
+  for (const v of fractions) {
+    for (const u of fractions) {
+      const x = rect.left + u * (rect.right - rect.left);
+      const y = rect.top - v * (rect.top - rect.bottom);
+      // Yoyo off to the side so nothing else orange or bright sits near the marker.
+      const s = snapshot({
+        phase: 'sleeping', pivot: [x, y], hand: null, yoyo: [x + 0.2, y - 0.02], length: 0.25, spin: 0, tension: 0.6,
+      });
+      for (let i = 0; i < 40; i++) renderer.render(s, nowMs += FRAME_MS);
+      const frame = grabFrame();
+      const ratio = canvas.width / canvas.clientWidth;
+      const [px, py] = window.qa.toScreen(x, y);
+      const cx = px * ratio;
+      const cy = py * ratio;
+      const half = Math.round(0.03 * ratio * (canvas.clientHeight / (rect.top - rect.bottom)));
+      let sumX = 0, sumY = 0, n = 0;
+      for (let yy = Math.max(0, Math.floor(cy - half)); yy < Math.min(canvas.height, Math.ceil(cy + half)); yy++) {
+        for (let xx = Math.max(0, Math.floor(cx - half)); xx < Math.min(canvas.width, Math.ceil(cx + half)); xx++) {
+          const i = (yy * canvas.width + xx) * 4;
+          const r = frame[i], g = frame[i + 1], b = frame[i + 2];
+          // The marker's orange: strongly red, mid green, little blue.
+          if (r > 170 && g > 90 && g < 215 && b < 130 && r - b > 90) { sumX += xx + 0.5; sumY += yy + 0.5; n++; }
+        }
+      }
+      results.push({
+        u, v, expected: [cx, cy], found: n > 0 ? [sumX / n, sumY / n] : null, pixels: n,
+        errorPx: n > 0 ? Math.hypot(sumX / n - cx, sumY / n - cy) / ratio : null,
+      });
+    }
+  }
+  return { rect, viewport: [canvas.clientWidth, canvas.clientHeight], ratio: canvas.width / canvas.clientWidth, results };
+}
+
+/** Drives the adaptive pixel ratio with synthetic frame times and reports the buffer size at each step. */
+function measureQuality() {
+  const steps = [];
+  const log = (label) => steps.push({ label, ratio: renderer.pixelRatio, bufferWidth: canvas.width, bufferHeight: canvas.height, cssWidth: canvas.clientWidth, cssHeight: canvas.clientHeight });
+  const s = STATES.sleeping(0);
+  let t = 1000;
+  log('start');
+  // 30 fps for 5 s: slower than 45 fps for longer than 4 s, so one step down.
+  for (let i = 0; i < 150; i++) renderer.render(s, (t += 1000 / 30));
+  log('after 5 s at 30 fps');
+  // Back to 60 fps for 14 s: not yet 15 s of fast frames, no recovery.
+  for (let i = 0; i < 14 * 60; i++) renderer.render(s, (t += 1000 / 60));
+  log('after 14 s at 60 fps');
+  // Two more seconds: the 15 s have passed, one step up.
+  for (let i = 0; i < 2 * 60; i++) renderer.render(s, (t += 1000 / 60));
+  log('after 16 s at 60 fps');
+  // A hidden tab: one 30 s gap must change nothing.
+  renderer.render(s, (t += 30000));
+  log('after a 30 s stall');
+  return steps;
+}
+
+/**
+ * Shader programs must all exist right after construction: a program compiled the first time something
+ * becomes visible (the yoyo at tie-on, the guide, the pause dimming) stalls that frame.
+ */
+function measurePrograms() {
+  const programs = () => renderer.renderer.info.programs.length;
+  const afterConstruction = programs();
+  // The flow of a session: a few idle frames (nothing tied, the hand visible), then the tie-on. Nothing may
+  // stall at the moments something shows for the first time (every shader and buffer should be ready).
+  const idle = [];
+  const first = [];
+  const frame = (list, snap) => {
+    const t0 = performance.now();
+    renderer.render(snap, (nowMs += FRAME_MS));
+    list.push(performance.now() - t0);
+  };
+  for (let i = 0; i < 5; i++) frame(idle, STATES.guide(i));
+  for (let i = 0; i < 5; i++) frame(first, STATES.tethered(i));
+  const seen = [];
+  for (const [name, build] of Object.entries(STATES)) {
+    if (name === 'guide') renderer.setGuide({ center: [0.02, 0.74], halfSize: [0.26, 0.36] });
+    for (let i = 0; i < 20; i++) renderer.render(build(i), (nowMs += FRAME_MS));
+    seen.push([name, programs()]);
+  }
+  renderer.setColor('#3b7bff');
+  return { afterConstruction, afterEveryState: programs(), seen, constructMs, idleFramesMs: idle, firstFramesMs: first };
+}
+
+/** Called by the script after it resizes the viewport: draws once and reports the layout the renderer chose. */
+window.afterResize = async () => {
+  await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  renderer.render(STATES.sleeping(0), (nowMs += FRAME_MS));
+  return {
+    css: [canvas.clientWidth, canvas.clientHeight], buffer: [canvas.width, canvas.height], ratio: renderer.pixelRatio,
+    rect: renderer.visibleWorld(),
+  };
+};
+
+window.qa = {
+  ready: false,
+  renderer,
+  rendererName: renderer.rendererName(),
+  stats: null,
+  pixelRatio: () => renderer.pixelRatio,
+  visibleWorld: () => renderer.visibleWorld(),
+  /** CSS pixel position of the world point (x, y, z = 0), from the exact visible rectangle. */
+  toScreen(x, y) {
+    const r = renderer.visibleWorld();
+    return [((x - r.left) / (r.right - r.left)) * canvas.clientWidth, ((r.top - y) / (r.top - r.bottom)) * canvas.clientHeight];
+  },
+};
+window.qa.crossOriginIsolated = crossOriginIsolated;
+
+if (benchMode === 'soak') {
+  window.qa.soak = await soak();
+  window.qa.ready = true;
+} else if (benchMode) {
+  window.qa.bench = await bench(benchMode);
+  window.qa.ready = true;
+} else if (stateName === 'cues') {
+  window.qa.cues = {
+    snap: measureCues('snap', false),
+    snapReduced: measureCues('snap', true),
+    catch: measureCues('catch', false),
+    catchReduced: measureCues('catch', true),
+  };
+  window.qa.ready = true;
+} else if (stateName === 'mapping') {
+  window.qa.mapping = measureMapping();
+  window.qa.ready = true;
+} else if (stateName === 'quality') {
+  window.qa.quality = measureQuality();
+  window.qa.ready = true;
+} else if (stateName === 'programs') {
+  window.qa.programs = measurePrograms();
+  window.qa.ready = true;
+} else if (stateName === 'context') {
+  window.qa.context = await contextRoundTrip();
+  window.qa.stats = renderer.stats();
+  await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  window.qa.ready = true;
+} else if (stateName === 'lifecycle') {
+  // React StrictMode mounts, unmounts and mounts again: the same canvas must survive that.
+  renderer.dispose();
+  renderer.dispose(); // a second dispose is harmless
+  for (let i = 0; i < 2; i++) {
+    const again = new YoyoRenderer(canvas);
+    again.render(STATES.sleeping(0), nowMs);
+    again.dispose();
+  }
+  renderer = new YoyoRenderer(canvas);
+  window.qa.renderer = renderer;
+  window.qa.rendererName = renderer.rendererName();
+  settle(90, STATES.sleeping);
+  window.qa.stats = renderer.stats();
+  await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  window.qa.ready = true;
+} else if (sheetMode === 'sequence') {
+  // The scripted scenario from its first frame; crops at the frames where something happens.
+  const marks = [
+    [0, 'tethered'], [47, '-1 frame'], [48, 'tether!'], [51, '+3'], [56, '+8'], [66, 'rolling'], [74, '-1 frame'], [75, 'snap!'],
+    [77, '+2'], [80, '+5'], [95, 'sleeping'], [180, 'sleeping'], [253, 'returning'], [275, 'returning'], [299, '-1 frame'],
+    [300, 'catch!'], [303, '+3'], [310, '+10'], [330, 'tethered'],
+  ];
+  const cols = 10;
+  const cellW = 190;
+  const cellH = 380;
+  const rows = Math.ceil(marks.length / cols);
+  const sheetState = makeSheet(cols, rows, cellW);
+  sheetState.sheet.height = rows * cellH;
+  sheetState.sheet.style.height = `${rows * cellH}px`;
+  const wanted = new Map(marks.map(([frame, label], index) => [frame, { label, index }]));
+  const START = 5600; // start of a scenario cycle: its phase clock is 0
+  for (let i = 0; i <= 340; i++) {
+    const t = START + i * FRAME_MS;
+    renderer.render(scenario(t), t);
+    const mark = wanted.get(i);
+    if (mark) {
+      cropWorld(sheetState, mark.index % cols, Math.floor(mark.index / cols), [0.02, 0.5], 0.2, 0.56, cellW, cellH, `${mark.label}  (${(i * FRAME_MS).toFixed(0)} ms)`);
+    }
+  }
+  canvas.style.display = 'none';
+  document.body.appendChild(sheetState.sheet);
+  window.qa.ready = true;
+} else if (sheetMode === 'colors') {
+  // Every selectable colour, slow spin (the finish is readable) over fast spin (the streak).
+  const cell = 300;
+  const sheetState = makeSheet(YOYO_COLORS.length, 2, cell);
+  for (const [row, name] of [[0, 'slow-spin'], [1, 'sleeping']]) {
+    YOYO_COLORS.forEach((color, column) => {
+      renderer.setColor(color.value);
+      settle(90, STATES[name]);
+      // The yoyo hangs where the state puts it.
+      cropYoyo(sheetState, column, row, hang(HOME, MAX_LENGTH, 0.05), 0.085, row === 0 ? color.name : '');
+    });
+  }
+  canvas.style.display = 'none';
+  document.body.appendChild(sheetState.sheet);
+  window.qa.ready = true;
+} else {
+  const colorIndex = Number(params.get('color') ?? 0);
+  renderer.setColor(YOYO_COLORS[colorIndex % YOYO_COLORS.length].value);
+  if (stateName === 'guide') renderer.setGuide({ center: [0.02, 0.74], halfSize: [0.26, 0.36] });
+  // Enough frames for every ease (hand presence, dimming, ring, tension) to settle.
+  settle(stateName === 'tethered-flash' ? 6 : 90);
+  window.qa.stats = renderer.stats();
+  // Two real frames so the compositor has presented the last draw before a screenshot.
+  await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  window.qa.ready = true;
+}
+</script>
+</body>
+</html>

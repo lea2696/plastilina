@@ -1,0 +1,6 @@
+# Recursos de terceros
+- @mediapipe/tasks-vision 0.10.22-rc.20250304, runtime WASM/JS: Google, Apache-2.0. Archivos copiados del paquete npm fijado por lockfile; hashes en assets/manifest.json.
+- Hand Landmarker full float16 modelo versión 1: Google, Apache-2.0 según su model card: https://storage.googleapis.com/mediapipe-assets/Model%20Card%20Hand%20Tracking%20%28Lite_Full%29%20with%20Fairness%20Oct%202021.pdf. URL exacta y hash en assets/manifest.json.
+- Dependencias runtime directas verificadas en `node_modules/*/package.json`: React 19.2.0 y React DOM 19.2.0 (MIT), Three.js 0.180.0 (MIT), MediaPipe Tasks Vision (Apache-2.0). El frontend incluye código runtime sujeto a esas licencias.
+- Herramientas directas de desarrollo verificadas en los metadatos del paquete local: TypeScript 5.9.3 y Playwright 1.56.0 (Apache-2.0); Vite 7.1.9, Vitest 3.2.4, ESLint 9.36.0, typescript-eslint 8.45.0, tsx 4.20.6, globals 16.4.0 y paquetes `@types`/`@eslint/js` fijados en package.json (MIT). Transitorios/versiones exactas en pnpm-lock.yaml. No se copia código de Rapier, PB-MPM ni PositionBasedDynamics al producto.
+- Pote, estudio, material y audio procedurales del proyecto: no usan assets comerciales.
